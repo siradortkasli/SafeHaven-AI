@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8" />
+    <title>SafeHaven AI Safe Zones</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        html, body, #map {
+            height: 100%;
+            width: 100%;
+            margin: 0;
+            background: #111827;
+        }
+        .safe-label {
+            font-size: 12px;
+            font-weight: bold;
+            color: white;
+            background: rgba(17, 24, 39, 0.9);
+            padding: 4px 8px;
+            border-radius: 8px;
+            border: 1px solid white;
+        }
+        .zone-pin { background: transparent !important; border: none !important; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script>
+    const map = L.map('map', { zoomControl: true }).setView([39.9055, 41.2658], 14);
+    const zoneLayerGroup = L.layerGroup().addTo(map);
+    const zoneMarkers = new Map();
+    let selectedZoneId = null;
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    function readZoneFields(z) {
+        return {
+            id: Number(z.id ?? z.Id ?? 0),
+            lat: Number(z.enlem ?? z.Enlem ?? 0),
+            lng: Number(z.boylam ?? z.Boylam ?? 0),
+            name: z.ad ?? z.Ad ?? "Güvenli Alan",
+            mahalle: z.mahalle ?? z.Mahalle ?? ""
+        };
+    }
+
+    function getOccupancyPercent(zone) {
+        const capacity = zone.kapasite ?? zone.Kapasite ?? 0;
+        const occupancy = zone.doluluk ?? zone.Doluluk ?? 0;
+        if (capacity > 0)
+            return Math.min(100, Math.round((occupancy / capacity) * 100));
+        return Math.min(100, occupancy);
+    }
+
+    function getOccupancyColor(percent) {
+        if (percent >= 80) return "#EF4444";
+        if (percent >= 50) return "#FACC15";
+        return "#22C55E";
+    }
+
+    function createZoneIcon(color, isSelected) {
+        const size = isSelected ? 20 : 16;
+        const border = isSelected ? "3px solid #FFFFFF" : "2px solid #E5E7EB";
+        return L.divIcon({
+            className: "zone-pin",
+            html: `<div style="width:${size}px;height:${size}px;background:${color};border:${border};border-radius:4px;box-shadow:0 0 10px rgba(0,0,0,0.5);"></div>`,
+            iconSize: [size, size],
+            iconAnchor: [size / 2, size / 2]
+        });
+    }
+
+    function loadSafeZones(zones) {
+        zoneLayerGroup.clearLayers();
+        zoneMarkers.clear();
+
+        if (!zones || zones.length === 0) {
+            map.setView([39.9055, 41.2658], 14);
+            setTimeout(() => map.invalidateSize(), 150);
+            return;
+        }
+
+        zones.forEach(z => {
+            const f = readZoneFields(z);
+            if (!Number.isFinite(f.lat) || !Number.isFinite(f.lng)) return;
+
+            const score = z.guvenlikSkoru ?? z.GuvenlikSkoru ?? 0;
+            const capacity = z.kapasite ?? z.Kapasite ?? 0;
+            const occupancy = z.doluluk ?? z.Doluluk ?? 0;
+            const percent = getOccupancyPercent(z);
+            const color = getOccupancyColor(percent);
+            const isSelected = selectedZoneId === f.id;
+
+            const marker = L.marker([f.lat, f.lng], {
+                icon: createZoneIcon(color, isSelected)
+            });
+
+            marker.bindTooltip(
+                `${f.name}<br>${f.mahalle}<br>Doluluk: %${percent}<br>Kapasite: ${occupancy}/${capacity}<br>Güvenlik: ${score}`,
+                { permanent: false, direction: "top", className: "safe-label" }
+            );
+
+            marker.on("click", () => {
+                window.chrome.webview.postMessage({
+                    type: "safeZoneClicked",
+                    id: f.id
+                });
+            });
+
+            marker._zoneMeta = { id: f.id, lat: f.lat, lng: f.lng, percent, color };
+            zoneMarkers.set(f.id, marker);
+            zoneLayerGroup.addLayer(marker);
+        });
+
+        const bounds = zones
+            .map(z => readZoneFields(z))
+            .filter(f => Number.isFinite(f.lat) && Number.isFinite(f.lng))
+            .map(f => [f.lat, f.lng]);
+
+        if (bounds.length > 0)
+            map.fitBounds(bounds, { padding: [40, 40] });
+
+        setTimeout(() => map.invalidateSize(), 150);
+    }
+
+    function focusOnSafeZone(data) {
+        const id = Number(data.id);
+        const lat = Number(data.enlem ?? data.lat);
+        const lng = Number(data.boylam ?? data.lng);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
+        selectedZoneId = id;
+
+        zoneMarkers.forEach((marker, zid) => {
+            const meta = marker._zoneMeta || {};
+            marker.setIcon(createZoneIcon(meta.color, zid === id));
+        });
+
+        const marker = zoneMarkers.get(id);
+        if (marker) {
+            map.flyTo(marker.getLatLng(), 17, { duration: 0.7 });
+            marker.openTooltip();
+        } else {
+            map.flyTo([lat, lng], 17, { duration: 0.7 });
+        }
+    }
+
+    function handleMessage(data) {
+        if (data && data.type === "focusSafeZone") {
+            focusOnSafeZone(data);
+            return;
+        }
+        if (Array.isArray(data)) {
+            loadSafeZones(data);
+            return;
+        }
+        if (data && (data.zones || data.Zones)) {
+            loadSafeZones(data.zones || data.Zones);
+            return;
+        }
+        loadSafeZones([]);
+    }
+
+    window.chrome.webview.addEventListener("message", event => handleMessage(event.data));
+
+    window.addEventListener("load", () => {
+        if (window.chrome?.webview?.postMessage) {
+            window.chrome.webview.postMessage({ type: "safeZoneMapReady" });
+        }
+    });
+
+    window.addEventListener('resize', () => map.invalidateSize());
+    </script>
+</body>
+</html>

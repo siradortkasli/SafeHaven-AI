@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8" />
+    <title>SafeHaven AI Map</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        html, body, #map { height: 100%; margin: 0; background: #111827; }
+        .building-label, .heat-label {
+            font-size: 12px; font-weight: bold; color: white;
+            background: rgba(17, 24, 39, 0.9); padding: 4px 8px;
+            border-radius: 8px; border: 1px solid white;
+        }
+        .heat-label { border-color: #FCA5A5; }
+        .building-pin { background: transparent !important; border: none !important; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script>
+    const map = L.map('map').setView([39.9055, 41.2658], 14);
+    map.createPane('heatmapPane');
+    map.getPane('heatmapPane').style.zIndex = 410;
+    map.createPane('buildingsPane');
+    map.getPane('buildingsPane').style.zIndex = 450;
+
+    const heatmapLayer = L.layerGroup([], { pane: 'heatmapPane' }).addTo(map);
+    const buildingLayer = L.layerGroup([], { pane: 'buildingsPane' }).addTo(map);
+    const buildingMarkers = new Map();
+    let selectedBuildingId = null;
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    function normalizeLevel(level) {
+        return (level || "").toString().toLowerCase()
+            .replace(/ı/g, "i").replace(/ğ/g, "g").replace(/ü/g, "u")
+            .replace(/ş/g, "s").replace(/ö/g, "o").replace(/ç/g, "c");
+    }
+
+    function readBuildingFields(b) {
+        return {
+            id: Number(b.id ?? b.Id ?? 0),
+            lat: Number(b.enlem ?? b.Enlem ?? 0),
+            lng: Number(b.boylam ?? b.Boylam ?? 0),
+            risk: Number(b.riskSkoru ?? b.risk_skoru ?? b.RiskSkoru ?? 0),
+            level: String(b.riskSeviyesi ?? b.risk_seviyesi ?? b.RiskSeviyesi ?? "")
+        };
+    }
+
+    function getColorByRisk(risk, level) {
+        const r = Number(risk);
+        if (!isNaN(r) && r > 0) {
+            if (r >= 75) return "#DC2626";
+            if (r >= 50) return "#F97316";
+            if (r >= 25) return "#FACC15";
+            return "#22C55E";
+        }
+        const lv = normalizeLevel(level);
+        if (lv.includes("acil") || lv.includes("mudahale")) return "#DC2626";
+        if (lv.includes("yuksek")) return "#F97316";
+        if (lv.includes("orta")) return "#FACC15";
+        return "#22C55E";
+    }
+
+    function createBuildingIcon(risk, level, isSelected) {
+        const color = getColorByRisk(risk, level);
+        const r = Number(risk) || 0;
+        const lv = normalizeLevel(level);
+        let size = 10;
+        if (lv.includes("acil") || lv.includes("mudahale") || r >= 75) size = 14;
+        else if (lv.includes("yuksek") || r >= 50) size = 12;
+        else if (lv.includes("orta") || r >= 25) size = 11;
+        if (isSelected) size += 4;
+        const border = isSelected ? "3px solid #FFFFFF" : "2px solid #F3F4F6";
+        return L.divIcon({
+            className: "building-pin",
+            html: `<div style="width:${size}px;height:${size}px;background:${color};border:${border};border-radius:50%;box-shadow:0 0 8px rgba(0,0,0,0.55);"></div>`,
+            iconSize: [size, size],
+            iconAnchor: [size / 2, size / 2]
+        });
+    }
+
+    function getHeatColor(risk) {
+        return getColorByRisk(risk);
+    }
+
+    function getHeatOpacity(risk) {
+        const r = Number(risk) || 0;
+        if (r >= 75) return 0.55;
+        if (r >= 50) return 0.5;
+        if (r >= 25) return 0.42;
+        return 0.3;
+    }
+
+    function clearAll() {
+        buildingLayer.clearLayers();
+        heatmapLayer.clearLayers();
+    }
+
+    function loadHeatmap(zones) {
+        heatmapLayer.clearLayers();
+        if (!zones || !zones.length) return;
+
+        zones.forEach(z => {
+            const lat = z.enlem || z.Enlem;
+            const lng = z.boylam || z.Boylam;
+            const avg = z.ortalamaRisk || z.OrtalamaRisk || 0;
+            const risk = z.maxRisk || z.MaxRisk || avg;
+            const name = z.mahalle || z.Mahalle;
+            const count = z.binaSayisi || z.BinaSayisi || 0;
+            const level = z.riskSeviyesi || z.RiskSeviyesi;
+            const color = getHeatColor(risk);
+
+            const circle = L.circle([lat, lng], {
+                radius: Math.min(180 + count * 12, 400),
+                color: color,
+                weight: 1,
+                fillColor: color,
+                fillOpacity: Math.min(getHeatOpacity(risk) * 0.45, 0.28),
+                pane: 'heatmapPane'
+            });
+
+            circle.bindTooltip(
+                `<b>${name}</b><br>En yuksek: ${risk}<br>Ortalama: ${avg}<br>${count} bina<br>${level}`,
+                { permanent: false, className: "heat-label" }
+            );
+
+            heatmapLayer.addLayer(circle);
+        });
+    }
+
+    function loadBuildings(buildings) {
+        buildingLayer.clearLayers();
+        buildingMarkers.clear();
+        if (!buildings || !buildings.length) return 0;
+
+        const coordCount = new Map();
+        let placed = 0;
+
+        buildings.forEach(b => {
+            const f = readBuildingFields(b);
+            let lat = f.lat;
+            let lng = f.lng;
+            if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+            if (Math.abs(lat) < 0.01 && Math.abs(lng) < 0.01) return;
+
+            const key = lat.toFixed(5) + ',' + lng.toFixed(5);
+            const stack = coordCount.get(key) || 0;
+            coordCount.set(key, stack + 1);
+            lat += stack * 0.00004;
+            lng += stack * 0.00004;
+
+            const isSelected = selectedBuildingId === f.id;
+            const marker = L.marker([lat, lng], {
+                icon: createBuildingIcon(f.risk, f.level, isSelected)
+            });
+
+            marker.bindTooltip(
+                `${b.mahalle || b.Mahalle}<br>${b.adres || b.Adres || ""}<br>${f.level}<br>Skor: ${f.risk.toFixed(1)}`,
+                { className: "building-label" }
+            );
+
+            marker.on("click", () => {
+                window.chrome.webview.postMessage({ type: "buildingClicked", id: f.id });
+            });
+
+            marker._buildingMeta = { id: f.id, lat, lng, risk: f.risk, level: f.level };
+            buildingMarkers.set(f.id, marker);
+            buildingLayer.addLayer(marker);
+            placed++;
+        });
+
+        buildingLayer.bringToFront();
+        return placed;
+    }
+
+    function focusOnBuilding(data) {
+        const id = Number(data.id);
+        const lat = Number(data.enlem ?? data.lat);
+        const lng = Number(data.boylam ?? data.lng);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
+        selectedBuildingId = id;
+
+        buildingMarkers.forEach((marker, mid) => {
+            const meta = marker._buildingMeta || {};
+            marker.setIcon(createBuildingIcon(meta.risk, meta.level, mid === id));
+        });
+
+        const marker = buildingMarkers.get(id);
+        if (marker) {
+            map.flyTo(marker.getLatLng(), 17, { duration: 0.7 });
+            marker.openTooltip();
+        } else {
+            map.flyTo([lat, lng], 17, { duration: 0.7 });
+        }
+    }
+
+    function handleMessage(data) {
+        if (Array.isArray(data)) {
+            loadBuildings(data);
+            return;
+        }
+
+        const buildingsOnly = data.buildingsOnly !== false;
+        if (!buildingsOnly && data.heatmap && data.heatmap.length) {
+            loadHeatmap(data.heatmap);
+        } else {
+            heatmapLayer.clearLayers();
+        }
+        let placed = 0;
+        if (data.buildings) placed = loadBuildings(data.buildings) || 0;
+        buildingLayer.bringToFront();
+
+        if (data.fitBounds && data.buildings?.length) {
+            const bounds = [];
+            data.buildings.forEach(b => {
+                const lat = Number(b.enlem ?? b.Enlem);
+                const lng = Number(b.boylam ?? b.Boylam);
+                if (Number.isFinite(lat) && Number.isFinite(lng)) bounds.push([lat, lng]);
+            });
+            if (bounds.length) map.fitBounds(bounds, { padding: [40, 40], maxZoom: 16 });
+        } else if (!data.buildings?.length) {
+            map.setView([39.9055, 41.2658], 14);
+        }
+
+        setTimeout(() => map.invalidateSize(), 150);
+
+        if (window.chrome?.webview?.postMessage) {
+            window.chrome.webview.postMessage({
+                type: "mapRendered",
+                buildingCount: data.buildings?.length || 0,
+                placedCount: placed
+            });
+        }
+    }
+
+    window.chrome.webview.addEventListener("message", event => {
+        const data = event.data;
+        if (data && data.type === "focusBuilding") {
+            focusOnBuilding(data);
+            return;
+        }
+        handleMessage(data);
+    });
+
+    window.addEventListener("load", () => {
+        if (window.chrome?.webview?.postMessage) {
+            window.chrome.webview.postMessage({ type: "mapReady" });
+        }
+    });
+    </script>
+</body>
+</html>
